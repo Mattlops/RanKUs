@@ -1,0 +1,6 @@
+{
+  "summary": "Plano detalhado de implementação para o RanKUs: remoção total de dados e nomes fictícios no Ranking e na seção Destaques da Home; contagem dinâmica de dias até 31 de dezembro no card de encerramento da temporada; permissão de 1 registro diário para cada modalidade do Termo (Clássico, Dueto e Quarteto, sendo que apenas o Quarteto pontua); validação de unicidade de Nicknames impedindo nomes duplicados; e esclarecimento técnico sobre a conectividade do APK com o Firebase Firestore.",
+  "updatedAt": "2026-10-17T07:21:24.091287792Z",
+  "requestFeedback": true,
+  "userFacing": true
+}
