@@ -98,6 +98,17 @@ data class UserProfile(
     val bestRank: Int = 1
 )
 
+data class UserAccount(
+    val id: String,
+    val nickname: String,
+    val email: String,
+    val passwordHash: String,
+    val avatarUrl: String = "https://lh3.googleusercontent.com/aida-public/AB6AXuArX2Naz8deCUE-iK-e43qANrfcLUYgmrDcshFaoSdcgNxv26A0dOXusFi8nsBhQz5jD_wxS_q2Z0DRMIHQWTLWGQLGZUbL6vROHg8445-FoSGtS-c7wP-abafkJGrquQJc3SerLYwlLMZOq1JejFWQwgZlnejCcdhdfN09-qc3lONtDKzOtFgUNE7CDOI8eHMmFCQ0fx5g5FWB_mTzCWVA4nHbC6dF26RexBB-aoxC2JwR2vjRwT2naQ",
+    val bio: String = "Competidor oficial RanKUs",
+    val favoriteGame: GameType = GameType.TERMO,
+    val createdAt: Long = System.currentTimeMillis()
+)
+
 data class DailyGameStatus(
     val gameType: GameType,
     val isCompleted: Boolean,
@@ -107,12 +118,12 @@ data class DailyGameStatus(
 
 data class WeeklyComparisonDay(
     val dayLabel: String,
-    val lucasScore: Float,
-    val carolScore: Float,
-    val guiScore: Float,
-    val userScore: Float,
-    val lucasRaw: Int = (lucasScore * 2890).toInt(),
-    val carolRaw: Int = (carolScore * 2410).toInt(),
-    val guiRaw: Int = (guiScore * 2180).toInt(),
-    val userRaw: Int = (userScore * 1945).toInt()
+    val lucasScore: Float = 0f,
+    val carolScore: Float = 0f,
+    val guiScore: Float = 0f,
+    val userScore: Float = 0f,
+    val lucasRaw: Int = 0,
+    val carolRaw: Int = 0,
+    val guiRaw: Int = 0,
+    val userRaw: Int = 0
 )

@@ -1,6 +1,8 @@
 package com.example.data
 
 import android.content.Context
+import android.content.SharedPreferences
+import android.net.Uri
 import com.example.R
 import com.example.data.firestore.FirestoreActivity
 import com.example.data.firestore.FirestoreScore
@@ -14,6 +16,7 @@ import com.example.data.models.ParsedScoreResult
 import com.example.data.models.Player
 import com.example.data.models.ScoreHistoryItem
 import com.example.data.models.TermoVariant
+import com.example.data.models.UserAccount
 import com.example.data.models.UserProfile
 import com.example.data.models.WeeklyComparisonDay
 import com.google.firebase.Firebase
@@ -24,9 +27,16 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.File
+import java.security.MessageDigest
 import java.time.LocalDate
 
-class RankusRepository(private val db: FirebaseFirestore? = null) {
+class RankusRepository(
+    private val db: FirebaseFirestore? = null,
+    private val context: Context? = null
+) {
 
     constructor(context: Context) : this(
         try {
@@ -35,21 +45,20 @@ class RankusRepository(private val db: FirebaseFirestore? = null) {
             )
         } catch (_: Exception) {
             null
-        }
+        },
+        context.applicationContext
     )
 
-    // Auth Session State
-    private val _isLoggedIn = MutableStateFlow(Firebase.auth.currentUser != null)
-    val isLoggedIn: StateFlow<Boolean> = _isLoggedIn.asStateFlow()
+    private val prefs: SharedPreferences? = context?.getSharedPreferences("rankus_storage_v2", Context.MODE_PRIVATE)
 
-    // Daily Scores State (true when at least 1 score was recorded today)
-    private val _hasDailyScores = MutableStateFlow(false)
-    val hasDailyScores: StateFlow<Boolean> = _hasDailyScores.asStateFlow()
+    // Auth & Active User State
+    private val _isLoggedIn = MutableStateFlow(false)
+    val isLoggedIn: StateFlow<Boolean> = _isLoggedIn.asStateFlow()
 
     // Current User Profile State
     private val _currentUser = MutableStateFlow(
         UserProfile(
-            id = "gamer_local",
+            id = "gamer_temp",
             name = "Gamer",
             handle = "@gamer",
             bio = "Competidor oficial RanKUs",
@@ -66,7 +75,11 @@ class RankusRepository(private val db: FirebaseFirestore? = null) {
     )
     val currentUser: StateFlow<UserProfile> = _currentUser.asStateFlow()
 
-    // Daily Games Status (All 3 uncompleted initially)
+    // Daily Scores State (true when at least 1 score was recorded today)
+    private val _hasDailyScores = MutableStateFlow(false)
+    val hasDailyScores: StateFlow<Boolean> = _hasDailyScores.asStateFlow()
+
+    // Daily Games Status (Termo, Globle, SizeItUp)
     private val _dailyGames = MutableStateFlow(
         listOf(
             DailyGameStatus(GameType.TERMO, isCompleted = false, points = 0, friendsCount = 0),
@@ -76,56 +89,849 @@ class RankusRepository(private val db: FirebaseFirestore? = null) {
     )
     val dailyGames: StateFlow<List<DailyGameStatus>> = _dailyGames.asStateFlow()
 
-    // Activity Feed (Starts empty - only real cloud/local activities)
+    // Activity Feed (Recent scores across players)
     private val _activities = MutableStateFlow<List<ActivityFeedItem>>(emptyList())
     val activities: StateFlow<List<ActivityFeedItem>> = _activities.asStateFlow()
 
-    // Leaderboard Players (Starts empty or only real users)
+    // Leaderboard Players
     private val _players = MutableStateFlow<List<Player>>(emptyList())
     val players: StateFlow<List<Player>> = _players.asStateFlow()
 
-    // User's Score History
+    // User's Score History (Strictly for current logged-in user)
     private val _scoreHistory = MutableStateFlow<List<ScoreHistoryItem>>(emptyList())
     val scoreHistory: StateFlow<List<ScoreHistoryItem>> = _scoreHistory.asStateFlow()
 
+    // Registered Accounts (Local Store + Cloud users)
+    private val _registeredAccounts = mutableListOf<UserAccount>()
+
+    // Password Recovery State: Email -> (Code, ExpiryTimestamp)
+    private var activeRecoveryCode: String? = null
+    private var activeRecoveryEmail: String? = null
+    private var recoveryCodeExpiry: Long = 0L
+
     init {
-        // Sync with Firebase Auth state
-        Firebase.auth.addAuthStateListener { auth ->
-            val user = auth.currentUser
-            _isLoggedIn.value = user != null
-            if (user != null) {
-                val displayName = user.displayName?.ifBlank { null }
-                    ?: user.email?.substringBefore("@")
-                    ?: "Gamer_${user.uid.take(4)}"
-                _currentUser.update {
-                    it.copy(
-                        id = user.uid,
-                        name = displayName,
-                        handle = user.email ?: "@$displayName"
+        loadAccountsFromStorage()
+        loadScoresFromStorage()
+        attachCloudListeners()
+
+        // Auto restore previous session if available
+        val savedUserId = prefs?.getString("active_user_id", null)
+        if (!savedUserId.isNullOrBlank()) {
+            val account = _registeredAccounts.find { it.id == savedUserId }
+            if (account != null) {
+                activateUserSession(account)
+            }
+        }
+    }
+
+    // -------------------------------------------------------------
+    // ACCOUNT STORAGE & AUTHENTICATION
+    // -------------------------------------------------------------
+
+    private fun hashPassword(password: String): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        val bytes = digest.digest(password.toByteArray(Charsets.UTF_8))
+        return bytes.joinToString("") { "%02x".format(it) }
+    }
+
+    private fun loadAccountsFromStorage() {
+        val accountsJson = prefs?.getString("accounts_json", null) ?: return
+        try {
+            val array = JSONArray(accountsJson)
+            _registeredAccounts.clear()
+            for (i in 0 until array.length()) {
+                val obj = array.getJSONObject(i)
+                _registeredAccounts.add(
+                    UserAccount(
+                        id = obj.getString("id"),
+                        nickname = obj.getString("nickname"),
+                        email = obj.getString("email"),
+                        passwordHash = obj.getString("passwordHash"),
+                        avatarUrl = obj.optString("avatarUrl", _currentUser.value.avatarUrl),
+                        bio = obj.optString("bio", "Competidor oficial RanKUs"),
+                        favoriteGame = try {
+                            GameType.valueOf(obj.optString("favoriteGame", "TERMO"))
+                        } catch (_: Exception) {
+                            GameType.TERMO
+                        },
+                        createdAt = obj.optLong("createdAt", System.currentTimeMillis())
                     )
+                )
+            }
+        } catch (_: Exception) {
+            // Ignore parse error
+        }
+    }
+
+    private fun saveAccountsToStorage() {
+        try {
+            val array = JSONArray()
+            _registeredAccounts.forEach { acc ->
+                val obj = JSONObject()
+                obj.put("id", acc.id)
+                obj.put("nickname", acc.nickname)
+                obj.put("email", acc.email)
+                obj.put("passwordHash", acc.passwordHash)
+                obj.put("avatarUrl", acc.avatarUrl)
+                obj.put("bio", acc.bio)
+                obj.put("favoriteGame", acc.favoriteGame.name)
+                obj.put("createdAt", acc.createdAt)
+                array.put(obj)
+            }
+            prefs?.edit()?.putString("accounts_json", array.toString())?.apply()
+        } catch (_: Exception) {
+            // Ignore
+        }
+    }
+
+    fun isNicknameAvailable(nickname: String, currentUserId: String? = null): Boolean {
+        val clean = nickname.trim()
+        if (clean.isBlank()) return false
+        val myUid = currentUserId ?: if (_isLoggedIn.value) _currentUser.value.id else null
+
+        // Check local accounts
+        val takenInLocal = _registeredAccounts.any { acc ->
+            acc.id != myUid && acc.nickname.trim().equals(clean, ignoreCase = true)
+        }
+        if (takenInLocal) return false
+
+        // Check players list
+        return _players.value.none { player ->
+            player.id != myUid && !player.isCurrentUser && player.name.trim().equals(clean, ignoreCase = true)
+        }
+    }
+
+    /**
+     * Registers a new account with unique nickname, valid email, and secure password.
+     */
+    fun register(nickname: String, email: String, password: String): Result<UserProfile> {
+        val cleanNick = nickname.trim()
+        val cleanEmail = email.trim().lowercase()
+
+        if (cleanNick.length < 2) {
+            return Result.failure(Exception("O apelido deve ter pelo menos 2 caracteres."))
+        }
+        if (!isNicknameAvailable(cleanNick)) {
+            return Result.failure(Exception("O apelido '$cleanNick' já está em uso por outro usuário."))
+        }
+        if (!cleanEmail.contains("@") || !cleanEmail.contains(".")) {
+            return Result.failure(Exception("Informe um e-mail válido (ex: seu.nome@dominio.com)."))
+        }
+        if (_registeredAccounts.any { it.email.equals(cleanEmail, ignoreCase = true) }) {
+            return Result.failure(Exception("Este e-mail já está cadastrado. Faça login ou recupere sua senha."))
+        }
+        if (password.length < 6) {
+            return Result.failure(Exception("A senha deve conter no mínimo 6 caracteres."))
+        }
+
+        val newId = "user_${System.currentTimeMillis()}_${(1000..9999).random()}"
+        val hashed = hashPassword(password)
+        val defaultAvatar = "https://lh3.googleusercontent.com/aida-public/AB6AXuArX2Naz8deCUE-iK-e43qANrfcLUYgmrDcshFaoSdcgNxv26A0dOXusFi8nsBhQz5jD_wxS_q2Z0DRMIHQWTLWGQLGZUbL6vROHg8445-FoSGtS-c7wP-abafkJGrquQJc3SerLYwlLMZOq1JejFWQwgZlnejCcdhdfN09-qc3lONtDKzOtFgUNE7CDOI8eHMmFCQ0fx5g5FWB_mTzCWVA4nHbC6dF26RexBB-aoxC2JwR2vjRwT2naQ"
+
+        val account = UserAccount(
+            id = newId,
+            nickname = cleanNick,
+            email = cleanEmail,
+            passwordHash = hashed,
+            avatarUrl = defaultAvatar,
+            bio = "Competidor oficial RanKUs",
+            favoriteGame = GameType.TERMO
+        )
+
+        _registeredAccounts.add(account)
+        saveAccountsToStorage()
+
+        // Sync new user to Firestore
+        db?.collection("users")?.document(newId)?.set(
+            FirestoreUser(
+                userId = newId,
+                nickname = cleanNick,
+                email = cleanEmail,
+                bio = account.bio,
+                avatarUrl = defaultAvatar
+            ).toMap()
+        )?.addOnFailureListener { e ->
+            handleFirestoreError(e, OperationType.CREATE, "users/$newId")
+        }
+
+        activateUserSession(account)
+        return Result.success(_currentUser.value)
+    }
+
+    /**
+     * Authenticates with Email or Nickname and Password.
+     * Prevents login with non-existent users or wrong credentials.
+     */
+    fun login(emailOrUser: String, password: String): Result<UserProfile> {
+        val cleanInput = emailOrUser.trim()
+        if (cleanInput.isBlank()) {
+            return Result.failure(Exception("Digite seu e-mail ou apelido."))
+        }
+        if (password.isBlank()) {
+            return Result.failure(Exception("Digite sua senha."))
+        }
+
+        val account = _registeredAccounts.find { acc ->
+            acc.email.equals(cleanInput, ignoreCase = true) ||
+                acc.nickname.equals(cleanInput, ignoreCase = true)
+        }
+
+        if (account == null) {
+            return Result.failure(Exception("Usuário ou e-mail não cadastrado. Verifique os dados ou crie uma conta."))
+        }
+
+        val hashed = hashPassword(password)
+        if (account.passwordHash != hashed) {
+            return Result.failure(Exception("Senha incorreta. Tente novamente ou use 'Esqueci minha senha'."))
+        }
+
+        activateUserSession(account)
+        return Result.success(_currentUser.value)
+    }
+
+    private fun activateUserSession(account: UserAccount) {
+        prefs?.edit()?.putString("active_user_id", account.id)?.apply()
+
+        _currentUser.update {
+            it.copy(
+                id = account.id,
+                name = account.nickname,
+                handle = account.email,
+                bio = account.bio,
+                avatarUrl = account.avatarUrl,
+                favoriteGame = account.favoriteGame
+            )
+        }
+        _isLoggedIn.value = true
+
+        // Refresh scores for this active user
+        refreshActiveUserScores(account.id)
+        syncScoresFromCloud(account.id)
+    }
+
+    fun onGoogleSignInSuccess(displayName: String) {
+        val user = Firebase.auth.currentUser
+        val uid = user?.uid ?: "google_${System.currentTimeMillis()}"
+        val email = user?.email ?: "$displayName@gmail.com"
+        val existing = _registeredAccounts.find { it.id == uid || it.email.equals(email, ignoreCase = true) }
+        val account = existing ?: UserAccount(
+            id = uid,
+            nickname = displayName,
+            email = email,
+            passwordHash = "",
+            bio = "Competidor oficial RanKUs via Google"
+        ).also {
+            _registeredAccounts.add(it)
+            saveAccountsToStorage()
+        }
+        activateUserSession(account)
+    }
+
+    fun logout() {
+        Firebase.auth.signOut()
+        prefs?.edit()?.remove("active_user_id")?.apply()
+        _isLoggedIn.value = false
+        _hasDailyScores.value = false
+        _dailyGames.update { list -> list.map { it.copy(isCompleted = false, points = 0) } }
+        _scoreHistory.value = emptyList()
+    }
+
+    // -------------------------------------------------------------
+    // FORGOT PASSWORD FLOW
+    // -------------------------------------------------------------
+
+    /**
+     * Step 1: Generates a 6-digit random code for registered email.
+     */
+    fun sendRecoveryCode(email: String): Result<String> {
+        val cleanEmail = email.trim().lowercase()
+        val account = _registeredAccounts.find { it.email.equals(cleanEmail, ignoreCase = true) }
+        if (account == null) {
+            return Result.failure(Exception("E-mail não encontrado no sistema. Verifique o endereço digitado."))
+        }
+
+        val code = (100000..999999).random().toString()
+        activeRecoveryCode = code
+        activeRecoveryEmail = cleanEmail
+        recoveryCodeExpiry = System.currentTimeMillis() + 15 * 60 * 1000 // 15 minutes
+
+        return Result.success(code)
+    }
+
+    /**
+     * Step 2: Validates the 6-digit code.
+     */
+    fun verifyRecoveryCode(email: String, code: String): Boolean {
+        val cleanEmail = email.trim().lowercase()
+        val cleanCode = code.trim()
+
+        if (activeRecoveryCode == null || activeRecoveryEmail == null) return false
+        if (System.currentTimeMillis() > recoveryCodeExpiry) return false
+        return activeRecoveryEmail == cleanEmail && activeRecoveryCode == cleanCode
+    }
+
+    /**
+     * Step 3: Replaces user password with the new one.
+     */
+    fun resetPassword(email: String, newPassword: String): Result<Unit> {
+        val cleanEmail = email.trim().lowercase()
+        if (newPassword.length < 6) {
+            return Result.failure(Exception("A nova senha deve conter no mínimo 6 caracteres."))
+        }
+
+        val index = _registeredAccounts.indexOfFirst { it.email.equals(cleanEmail, ignoreCase = true) }
+        if (index == -1) {
+            return Result.failure(Exception("Conta não encontrada."))
+        }
+
+        val newHashed = hashPassword(newPassword)
+        val updated = _registeredAccounts[index].copy(passwordHash = newHashed)
+        _registeredAccounts[index] = updated
+        saveAccountsToStorage()
+
+        activeRecoveryCode = null
+        activeRecoveryEmail = null
+        return Result.success(Unit)
+    }
+
+    // -------------------------------------------------------------
+    // AVATAR IMAGE PERSISTENCE IN APP INTERNAL STORAGE
+    // -------------------------------------------------------------
+
+    /**
+     * Copies a chosen image URI into the app's internal filesDir permanently.
+     * This ensures the avatar NEVER disappears upon closing and reopening the app.
+     */
+    fun saveAvatarLocally(uri: Uri): String {
+        if (context == null) return uri.toString()
+        return try {
+            val avatarsDir = File(context.filesDir, "avatars").apply { mkdirs() }
+            val destFile = File(avatarsDir, "avatar_${_currentUser.value.id}.jpg")
+
+            context.contentResolver.openInputStream(uri)?.use { input ->
+                destFile.outputStream().use { output ->
+                    input.copyTo(output)
                 }
-                syncUserProfileFromCloud(user.uid, displayName, user.email)
-                syncScoresFromCloud(user.uid)
-                attachCloudListeners()
+            }
+            Uri.fromFile(destFile).toString()
+        } catch (_: Exception) {
+            uri.toString()
+        }
+    }
+
+    // -------------------------------------------------------------
+    // SCORES & STREAK MANAGEMENT
+    // -------------------------------------------------------------
+
+    private fun loadScoresFromStorage() {
+        val scoresJson = prefs?.getString("scores_json", null) ?: return
+        try {
+            val array = JSONArray(scoresJson)
+            val list = mutableListOf<ScoreHistoryItem>()
+            for (i in 0 until array.length()) {
+                val obj = array.getJSONObject(i)
+                val gType = try { GameType.valueOf(obj.getString("gameType")) } catch (_: Exception) { GameType.TERMO }
+                val variant = try {
+                    if (obj.has("variant")) TermoVariant.valueOf(obj.getString("variant")) else null
+                } catch (_: Exception) { null }
+
+                list.add(
+                    ScoreHistoryItem(
+                        id = obj.getString("id"),
+                        userId = obj.getString("userId"),
+                        gameType = gType,
+                        variant = variant,
+                        dateKey = obj.getString("dateKey"),
+                        score = obj.getInt("score"),
+                        details = obj.optString("details", ""),
+                        rawGrid = try {
+                            val gridArr = obj.getJSONArray("rawGrid")
+                            List(gridArr.length()) { idx -> gridArr.getString(idx) }
+                        } catch (_: Exception) { emptyList() },
+                        streak = obj.optInt("streak", 0).let { if (it > 0) it else null },
+                        timestampMs = obj.optLong("timestampMs", System.currentTimeMillis())
+                    )
+                )
+            }
+            _scoreHistory.value = list
+        } catch (_: Exception) {
+            // Ignore
+        }
+    }
+
+    private fun saveScoresToStorage() {
+        try {
+            val array = JSONArray()
+            _scoreHistory.value.forEach { item ->
+                val obj = JSONObject()
+                obj.put("id", item.id)
+                obj.put("userId", item.userId)
+                obj.put("gameType", item.gameType.name)
+                if (item.variant != null) obj.put("variant", item.variant.name)
+                obj.put("dateKey", item.dateKey)
+                obj.put("score", item.score)
+                obj.put("details", item.details)
+                obj.put("timestampMs", item.timestampMs)
+                if (item.streak != null) obj.put("streak", item.streak)
+                val gridArr = JSONArray()
+                item.rawGrid.forEach { gridArr.put(it) }
+                obj.put("rawGrid", gridArr)
+                array.put(obj)
+            }
+            prefs?.edit()?.putString("scores_json", array.toString())?.apply()
+        } catch (_: Exception) {
+            // Ignore
+        }
+    }
+
+    /**
+     * Strict streak calculation:
+     * - Counts consecutive days backwards.
+     * - If yesterday was missed and today hasn't been played, streak is 0.
+     * - If yesterday was missed and today was played, streak is 1.
+     */
+    private fun calculateConsecutiveStreak(userScores: List<ScoreHistoryItem>): Int {
+        val distinctDates = userScores.map { it.dateKey }.distinct().toSet()
+        val today = LocalDate.now()
+        val todayStr = today.toString()
+        val yesterdayStr = today.minusDays(1).toString()
+
+        return if (distinctDates.contains(todayStr)) {
+            var streak = 1
+            var checkDate = today.minusDays(1)
+            while (distinctDates.contains(checkDate.toString())) {
+                streak++
+                checkDate = checkDate.minusDays(1)
+            }
+            streak
+        } else if (distinctDates.contains(yesterdayStr)) {
+            var streak = 1
+            var checkDate = today.minusDays(2)
+            while (distinctDates.contains(checkDate.toString())) {
+                streak++
+                checkDate = checkDate.minusDays(1)
+            }
+            streak
+        } else {
+            0
+        }
+    }
+
+    private fun refreshActiveUserScores(uid: String) {
+        val userScores = _scoreHistory.value.filter { it.userId == uid }
+        val todayStr = LocalDate.now().toString()
+        val todayScores = userScores.filter { it.dateKey == todayStr }
+
+        val totalPoints = userScores.sumOf { it.score }
+        val todayPoints = todayScores.sumOf { it.score }
+        val streak = calculateConsecutiveStreak(userScores)
+
+        _hasDailyScores.value = todayScores.isNotEmpty()
+
+        _dailyGames.update { list ->
+            list.map { g ->
+                val record = todayScores.find { it.gameType == g.gameType }
+                if (record != null) {
+                    g.copy(isCompleted = true, points = record.score)
+                } else {
+                    g.copy(isCompleted = false, points = 0)
+                }
             }
         }
 
-        // Attach listeners if already authenticated
-        if (Firebase.auth.currentUser != null) {
-            val user = Firebase.auth.currentUser!!
-            val displayName = user.displayName?.ifBlank { null }
-                ?: user.email?.substringBefore("@")
-                ?: "Gamer_${user.uid.take(4)}"
-            _currentUser.update {
-                it.copy(
-                    id = user.uid,
-                    name = displayName,
-                    handle = user.email ?: "@$displayName"
-                )
+        _currentUser.update {
+            it.copy(
+                totalScore = totalPoints,
+                todayScore = todayPoints,
+                streakDays = streak,
+                matchesPlayed = userScores.size
+            )
+        }
+
+        rebuildPlayersLeaderboard()
+    }
+
+    fun canSubmitGameToday(gameType: GameType, variant: TermoVariant? = null): Boolean {
+        val uid = _currentUser.value.id
+        val todayStr = LocalDate.now().toString()
+        val userScores = _scoreHistory.value.filter { it.userId == uid && it.dateKey == todayStr }
+
+        return if (gameType == GameType.TERMO) {
+            val targetVariant = variant ?: TermoVariant.QUARTETO
+            val alreadySubmitted = userScores.any {
+                it.gameType == GameType.TERMO && (it.variant ?: TermoVariant.QUARTETO) == targetVariant
             }
-            syncUserProfileFromCloud(user.uid, displayName, user.email)
-            syncScoresFromCloud(user.uid)
-            attachCloudListeners()
+            !alreadySubmitted
+        } else {
+            val alreadySubmitted = userScores.any { it.gameType == gameType }
+            !alreadySubmitted
+        }
+    }
+
+    fun submitScore(result: ParsedScoreResult): Boolean {
+        if (!canSubmitGameToday(result.gameType, result.variant)) {
+            return false
+        }
+
+        // Rule: Termo Clássico and Dueto don't award points in Season 2026, only Quarteto
+        val isScoringTermo = result.gameType == GameType.TERMO && (result.variant ?: TermoVariant.QUARTETO) == TermoVariant.QUARTETO
+        val effectivePoints = if (result.gameType == GameType.TERMO && !isScoringTermo) {
+            0
+        } else {
+            result.score.coerceIn(0, 100)
+        }
+
+        val uid = _currentUser.value.id
+        val todayStr = LocalDate.now().toString()
+        val effectiveVariant = if (result.gameType == GameType.TERMO) (result.variant ?: TermoVariant.QUARTETO) else null
+        val variantSuffix = if (effectiveVariant != null) "_${effectiveVariant.id}" else ""
+        val scoreId = "${uid}_${result.gameType.title.lowercase()}${variantSuffix}_$todayStr"
+
+        val historyItem = ScoreHistoryItem(
+            id = scoreId,
+            userId = uid,
+            gameType = result.gameType,
+            variant = effectiveVariant,
+            dateKey = todayStr,
+            score = effectivePoints,
+            details = result.details,
+            rawGrid = result.rawGrid,
+            streak = result.streak
+        )
+
+        // Prepend to history & save locally
+        _scoreHistory.update { listOf(historyItem) + it.filterNot { item -> item.id == scoreId } }
+        saveScoresToStorage()
+
+        // Write score to Firestore
+        db?.let { firestore ->
+            val firestoreScore = FirestoreScore(
+                userId = uid,
+                nickname = _currentUser.value.name,
+                avatarUrl = _currentUser.value.avatarUrl,
+                gameType = result.gameType.title.lowercase(),
+                dateKey = todayStr,
+                score = effectivePoints.toLong(),
+                rawText = result.rawGrid.joinToString("\n"),
+                details = result.details
+            )
+            firestore.collection("scores").document(scoreId).set(firestoreScore.toMap())
+                .addOnFailureListener { e ->
+                    handleFirestoreError(e, OperationType.CREATE, "scores/$scoreId")
+                }
+
+            if (effectivePoints > 0) {
+                val actId = "act_${System.currentTimeMillis()}"
+                val firestoreAct = FirestoreActivity(
+                    userId = uid,
+                    playerName = _currentUser.value.name,
+                    avatarUrl = _currentUser.value.avatarUrl,
+                    gameName = if (effectiveVariant != null) "${result.gameType.title} (${effectiveVariant.label})" else result.gameType.title,
+                    gameLetter = result.gameType.title.first().toString(),
+                    pointsEarned = effectivePoints.toLong()
+                )
+                firestore.collection("activities").document(actId).set(firestoreAct.toMap())
+                    .addOnFailureListener { e ->
+                        handleFirestoreError(e, OperationType.CREATE, "activities/$actId")
+                    }
+            }
+        }
+
+        // Recalculate user totals directly from scores (the single source of truth!)
+        refreshActiveUserScores(uid)
+
+        // Update totalScore in Firestore users/$uid
+        db?.collection("users")?.document(uid)?.update(
+            mapOf(
+                "totalScore" to _currentUser.value.totalScore.toLong(),
+                "streakDays" to _currentUser.value.streakDays.toLong(),
+                "matchesPlayed" to _currentUser.value.matchesPlayed.toLong()
+            )
+        )
+
+        return true
+    }
+
+    fun deleteScore(record: ScoreHistoryItem): Boolean {
+        val uid = _currentUser.value.id
+        if (record.userId != uid) return false
+
+        _scoreHistory.update { list -> list.filterNot { it.id == record.id } }
+        saveScoresToStorage()
+
+        db?.collection("scores")?.document(record.id)?.delete()
+            ?.addOnFailureListener { e ->
+                handleFirestoreError(e, OperationType.DELETE, "scores/${record.id}")
+            }
+
+        refreshActiveUserScores(uid)
+
+        db?.collection("users")?.document(uid)?.update(
+            mapOf(
+                "totalScore" to _currentUser.value.totalScore.toLong(),
+                "streakDays" to _currentUser.value.streakDays.toLong(),
+                "matchesPlayed" to _currentUser.value.matchesPlayed.toLong()
+            )
+        )
+
+        return true
+    }
+
+    // -------------------------------------------------------------
+    // RANKINGS FILTERING & LEADERBOARD
+    // -------------------------------------------------------------
+
+    private fun rebuildPlayersLeaderboard() {
+        val allUsers = _registeredAccounts.associateBy { it.id }
+        val currentUid = _currentUser.value.id
+
+        // Compute totalScore per user from score history
+        val userTotals = mutableMapOf<String, Int>()
+        _scoreHistory.value.forEach { item ->
+            userTotals[item.userId] = (userTotals[item.userId] ?: 0) + item.score
+        }
+
+        val playersList = mutableListOf<Player>()
+
+        // 1. Current user
+        val myUser = _currentUser.value
+        val myStreak = myUser.streakDays
+        val myMatches = myUser.matchesPlayed
+        playersList.add(
+            Player(
+                id = currentUid,
+                name = myUser.name,
+                handle = myUser.handle,
+                avatarUrl = myUser.avatarUrl,
+                score = myUser.totalScore,
+                rank = 1,
+                streak = myStreak,
+                gamesCount = myMatches,
+                isCurrentUser = true,
+                badge = "VOCÊ"
+            )
+        )
+
+        // 2. Other registered users
+        allUsers.values.filterNot { it.id == currentUid }.forEach { acc ->
+            val accScores = _scoreHistory.value.filter { it.userId == acc.id }
+            val accStreak = calculateConsecutiveStreak(accScores)
+            playersList.add(
+                Player(
+                    id = acc.id,
+                    name = acc.nickname,
+                    handle = acc.email,
+                    avatarUrl = acc.avatarUrl,
+                    score = userTotals[acc.id] ?: 0,
+                    rank = 2,
+                    streak = accStreak,
+                    gamesCount = accScores.size,
+                    isCurrentUser = false
+                )
+            )
+        }
+
+        _players.value = playersList.sortedByDescending { it.score }.mapIndexed { idx, p ->
+            p.copy(
+                rank = idx + 1,
+                badge = if (idx == 0 && p.score > 0) "LÍDER" else if (p.isCurrentUser) "VOCÊ" else null
+            )
+        }
+    }
+
+    /**
+     * Filters players dynamically based on selected Game pill and Time range.
+     */
+    fun getRankingPlayers(gameFilter: String, timeFilter: String): List<Player> {
+        val today = LocalDate.now()
+        val todayStr = today.toString()
+        val weekStartStr = today.minusDays(6).toString()
+        val monthStartStr = today.minusDays(29).toString()
+
+        val matchingScores = _scoreHistory.value.filter { item ->
+            val matchGame = when (gameFilter) {
+                "Termo" -> item.gameType == GameType.TERMO
+                "Globle" -> item.gameType == GameType.GLOBLE
+                "SizeItUp" -> item.gameType == GameType.SIZEITUP
+                else -> true
+            }
+            val matchTime = when (timeFilter) {
+                "Hoje" -> item.dateKey == todayStr
+                "Semana" -> item.dateKey >= weekStartStr
+                "Mês" -> item.dateKey >= monthStartStr
+                else -> true
+            }
+            matchGame && matchTime
+        }
+
+        val scoresByUser = matchingScores.groupBy { it.userId }
+        val allCompetitors = _players.value
+
+        return allCompetitors.map { player ->
+            val userRecords = scoresByUser[player.id] ?: emptyList()
+            val filteredScore = userRecords.sumOf { it.score }
+            val games = userRecords.size
+            player.copy(
+                score = filteredScore,
+                gamesCount = games
+            )
+        }.sortedByDescending { it.score }.mapIndexed { idx, p ->
+            p.copy(
+                rank = idx + 1,
+                badge = if (idx == 0 && p.score > 0) "LÍDER" else if (p.isCurrentUser) "VOCÊ" else null
+            )
+        }
+    }
+
+    fun getEvolutionData(gameFilter: String, timeFilter: String): List<WeeklyComparisonDay> {
+        val today = LocalDate.now()
+        val todayStr = today.toString()
+        val currentUid = _currentUser.value.id
+
+        val userFilteredScores = _scoreHistory.value.filter { item ->
+            item.userId == currentUid && when (gameFilter) {
+                "Termo" -> item.gameType == GameType.TERMO
+                "Globle" -> item.gameType == GameType.GLOBLE
+                "SizeItUp" -> item.gameType == GameType.SIZEITUP
+                else -> true
+            }
+        }
+
+        val totalUserPoints = userFilteredScores.sumOf { it.score }.coerceAtLeast(1)
+
+        return when (timeFilter) {
+            "Hoje" -> {
+                val slots = listOf("08h", "11h", "14h", "17h", "20h", "22h", "Agora")
+                val todayScores = userFilteredScores.filter { it.dateKey == todayStr }
+                val sumToday = todayScores.sumOf { it.score }
+                slots.mapIndexed { idx, label ->
+                    val fraction = if (sumToday > 0) ((idx + 1).toFloat() / slots.size).coerceIn(0.1f, 1f) else 0f
+                    val raw = (fraction * sumToday).toInt()
+                    WeeklyComparisonDay(
+                        dayLabel = label,
+                        userScore = fraction,
+                        userRaw = raw
+                    )
+                }
+            }
+            "Mês" -> {
+                val weeks = listOf("Sem 1", "Sem 2", "Sem 3", "Sem 4")
+                weeks.mapIndexed { idx, label ->
+                    val daysBackStart = (3 - idx) * 7
+                    val daysBackEnd = daysBackStart - 7
+                    val start = today.minusDays(daysBackStart.toLong()).toString()
+                    val end = today.minusDays(daysBackEnd.coerceAtLeast(0).toLong()).toString()
+                    val weekPts = userFilteredScores.filter { it.dateKey in start..end }.sumOf { it.score }
+                    val fraction = if (totalUserPoints > 0) (weekPts.toFloat() / 300f).coerceIn(0f, 1f) else 0f
+                    WeeklyComparisonDay(
+                        dayLabel = label,
+                        userScore = fraction,
+                        userRaw = weekPts
+                    )
+                }
+            }
+            "Geral" -> {
+                val seasons = listOf("Ciclo 1", "Ciclo 2", "Ciclo 3", "Ciclo 4", "Ciclo 5", "Atual")
+                seasons.mapIndexed { idx, label ->
+                    val fraction = if (_currentUser.value.totalScore > 0) ((idx + 1).toFloat() / seasons.size) else 0f
+                    WeeklyComparisonDay(
+                        dayLabel = label,
+                        userScore = fraction,
+                        userRaw = (fraction * _currentUser.value.totalScore).toInt()
+                    )
+                }
+            }
+            else -> {
+                // "Semana" (Last 7 days: Seg, Ter, Qua, Qui, Sex, Sáb, Hoje)
+                val dayNames = listOf("Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Hoje")
+                dayNames.mapIndexed { idx, label ->
+                    val targetDate = today.minusDays((6 - idx).toLong()).toString()
+                    val dayPoints = userFilteredScores.filter { it.dateKey == targetDate }.sumOf { it.score }
+                    val fraction = if (dayPoints > 0) (dayPoints.toFloat() / 100f).coerceIn(0.1f, 1f) else 0f
+                    WeeklyComparisonDay(
+                        dayLabel = label,
+                        userScore = fraction,
+                        userRaw = dayPoints
+                    )
+                }
+            }
+        }
+    }
+
+    // -------------------------------------------------------------
+    // PROFILE EDITING
+    // -------------------------------------------------------------
+
+    fun updateProfile(name: String, bio: String, favGame: GameType, avatarUrl: String? = null): Boolean {
+        val trimmedName = name.trim().ifBlank { _currentUser.value.name }
+        if (!isNicknameAvailable(trimmedName, _currentUser.value.id)) {
+            return false
+        }
+        val effectiveAvatar = avatarUrl ?: _currentUser.value.avatarUrl
+
+        _currentUser.update {
+            it.copy(
+                name = trimmedName,
+                bio = bio,
+                favoriteGame = favGame,
+                avatarUrl = effectiveAvatar
+            )
+        }
+
+        // Update local registered accounts
+        val idx = _registeredAccounts.indexOfFirst { it.id == _currentUser.value.id }
+        if (idx != -1) {
+            _registeredAccounts[idx] = _registeredAccounts[idx].copy(
+                nickname = trimmedName,
+                bio = bio,
+                favoriteGame = favGame,
+                avatarUrl = effectiveAvatar
+            )
+            saveAccountsToStorage()
+        }
+
+        rebuildPlayersLeaderboard()
+
+        // Sync with Firestore
+        val uid = _currentUser.value.id
+        db?.collection("users")?.document(uid)?.update(
+            mapOf(
+                "nickname" to trimmedName,
+                "bio" to bio,
+                "favoriteGame" to favGame.title,
+                "avatarUrl" to effectiveAvatar
+            )
+        )?.addOnFailureListener { e ->
+            handleFirestoreError(e, OperationType.UPDATE, "users/$uid")
+        }
+
+        return true
+    }
+
+    fun reactToActivity(activityId: String, emoji: String) {
+        _activities.update { list ->
+            list.map { item ->
+                if (item.id == activityId) {
+                    val isAlreadyReacted = item.userReactions.contains(emoji)
+                    val newReactions = if (isAlreadyReacted) item.userReactions - emoji else item.userReactions + emoji
+                    val delta = if (isAlreadyReacted) -1 else 1
+                    val updated = when (emoji) {
+                        "🔥" -> item.copy(fireReactions = (item.fireReactions + delta).coerceAtLeast(0), userReactions = newReactions)
+                        "👏" -> item.copy(applauseReactions = (item.applauseReactions + delta).coerceAtLeast(0), userReactions = newReactions)
+                        "🎯" -> item.copy(targetReactions = (item.targetReactions + delta).coerceAtLeast(0), userReactions = newReactions)
+                        else -> item
+                    }
+                    db?.collection("activities")?.document(activityId)?.update(
+                        when (emoji) {
+                            "🔥" -> "fireReactions" to updated.fireReactions.toLong()
+                            "👏" -> "applauseReactions" to updated.applauseReactions.toLong()
+                            "🎯" -> "targetReactions" to updated.targetReactions.toLong()
+                            else -> "fireReactions" to updated.fireReactions.toLong()
+                        }.let { mapOf(it.first to it.second) }
+                    )
+                    updated
+                } else item
+            }
         }
     }
 
@@ -164,43 +970,6 @@ class RankusRepository(private val db: FirebaseFirestore? = null) {
                     _activities.value = cloudActivities
                 }
             }
-
-        // Real-time snapshot listener on cloud users for Leaderboard
-        db?.collection("users")
-            ?.orderBy("totalScore", Query.Direction.DESCENDING)
-            ?.limit(50)
-            ?.addSnapshotListener { snapshot, error ->
-                if (error != null) {
-                    handleFirestoreError(error, OperationType.LIST, "users")
-                    return@addSnapshotListener
-                }
-                if (snapshot != null && !snapshot.isEmpty) {
-                    val currentUid = Firebase.auth.currentUser?.uid ?: _currentUser.value.id
-                    val cloudPlayers = snapshot.documents.mapIndexedNotNull { idx, doc ->
-                        val uid = doc.getString("userId") ?: doc.id
-                        val name = doc.getString("nickname") ?: "Gamer"
-                        val totalScore = doc.getLong("totalScore")?.toInt() ?: 0
-                        val streak = doc.getLong("streakDays")?.toInt() ?: 0
-                        val matches = doc.getLong("matchesPlayed")?.toInt() ?: 0
-                        val avatarUrl = doc.getString("avatarUrl") ?: _currentUser.value.avatarUrl
-                        val isCurrent = uid == currentUid
-                        Player(
-                            id = uid,
-                            name = if (isCurrent) "Você ($name)" else name,
-                            handle = "@${name.lowercase().replace(" ", "_")}",
-                            avatarUrl = avatarUrl,
-                            score = totalScore,
-                            rank = idx + 1,
-                            streak = streak,
-                            gamesCount = matches,
-                            isCurrentUser = isCurrent,
-                            badge = if (idx == 0) "LÍDER" else if (isCurrent) "VOCÊ" else null,
-                            winRate = if (matches > 0) 85 else 0
-                        )
-                    }
-                    _players.value = cloudPlayers
-                }
-            }
     }
 
     private fun syncScoresFromCloud(uid: String) {
@@ -208,7 +977,7 @@ class RankusRepository(private val db: FirebaseFirestore? = null) {
             ?.whereEqualTo("userId", uid)
             ?.get()
             ?.addOnSuccessListener { snapshot ->
-                if (snapshot != null) {
+                if (snapshot != null && !snapshot.isEmpty) {
                     val todayStr = LocalDate.now().toString()
                     val cloudScores = snapshot.documents.mapNotNull { doc ->
                         val gameTypeStr = doc.getString("gameType") ?: return@mapNotNull null
@@ -231,456 +1000,14 @@ class RankusRepository(private val db: FirebaseFirestore? = null) {
                             details = details,
                             rawGrid = if (rawText.isNotBlank()) rawText.lines() else emptyList()
                         )
-                    }.sortedByDescending { it.dateKey }
-
-                    _scoreHistory.value = cloudScores
-
-                    // Check today's scores
-                    val todayScores = cloudScores.filter { it.dateKey == todayStr }
-                    if (todayScores.isNotEmpty()) {
-                        _hasDailyScores.value = true
-                        _dailyGames.update { list ->
-                            list.map { g ->
-                                val scoreItem = todayScores.find { it.gameType == g.gameType }
-                                if (scoreItem != null) {
-                                    g.copy(isCompleted = true, points = scoreItem.score)
-                                } else g
-                            }
-                        }
-                        val sumToday = todayScores.sumOf { it.score }
-                        _currentUser.update { it.copy(todayScore = sumToday) }
                     }
+
+                    // Merge with existing local scores
+                    val currentList = _scoreHistory.value.filterNot { it.userId == uid }
+                    _scoreHistory.value = (cloudScores + currentList).sortedByDescending { it.dateKey }
+                    saveScoresToStorage()
+                    refreshActiveUserScores(uid)
                 }
             }
-    }
-
-    private fun syncUserProfileFromCloud(uid: String, displayName: String, email: String?) {
-        db?.collection("users")?.document(uid)?.get()?.addOnSuccessListener { doc ->
-            if (doc != null && doc.exists()) {
-                val nickname = doc.getString("nickname") ?: displayName
-                val bio = doc.getString("bio") ?: "Gamer do RanKUs"
-                val totalScore = doc.getLong("totalScore")?.toInt() ?: 0
-                val streak = doc.getLong("streakDays")?.toInt() ?: 0
-                val matches = doc.getLong("matchesPlayed")?.toInt() ?: 0
-                val avatar = doc.getString("avatarUrl") ?: _currentUser.value.avatarUrl
-                _currentUser.update {
-                    it.copy(
-                        name = nickname,
-                        bio = bio,
-                        totalScore = totalScore,
-                        streakDays = streak,
-                        matchesPlayed = matches,
-                        avatarUrl = avatar
-                    )
-                }
-            } else {
-                val newProfile = FirestoreUser(
-                    userId = uid,
-                    nickname = displayName,
-                    email = email,
-                    bio = "Jogador oficial RanKUs"
-                )
-                db?.collection("users")?.document(uid)?.set(newProfile.toMap())
-                    ?.addOnFailureListener { e ->
-                        handleFirestoreError(e, OperationType.CREATE, "users/$uid")
-                    }
-            }
-        }
-    }
-
-    fun login(emailOrUser: String) {
-        _isLoggedIn.value = true
-        _currentUser.update {
-            if (emailOrUser.contains("@")) {
-                val cleanHandle = emailOrUser.substringBefore("@")
-                it.copy(name = cleanHandle.replaceFirstChar { c -> c.uppercase() }, handle = emailOrUser)
-            } else if (emailOrUser.isNotBlank()) {
-                it.copy(name = emailOrUser, handle = "@$emailOrUser")
-            } else it
-        }
-    }
-
-    fun logout() {
-        Firebase.auth.signOut()
-        _isLoggedIn.value = false
-    }
-
-    fun toggleDailyScores(hasScores: Boolean) {
-        _hasDailyScores.value = hasScores
-    }
-
-    /**
-     * Checks if a user is allowed to submit a result for the given game today.
-     * Rule: 
-     * - Termo: Can register 1 time for Clássico, 1 time for Dueto, and 1 time for Quarteto per day!
-     * - Globle and SizeItUp: 1 submission per day.
-     */
-    fun canSubmitGameToday(gameType: GameType, variant: TermoVariant? = null): Boolean {
-        val todayStr = LocalDate.now().toString()
-        return if (gameType == GameType.TERMO) {
-            val targetVariant = variant ?: TermoVariant.QUARTETO
-            val alreadyInHistory = _scoreHistory.value.any {
-                it.gameType == GameType.TERMO && (it.variant ?: TermoVariant.QUARTETO) == targetVariant && it.dateKey == todayStr
-            }
-            !alreadyInHistory
-        } else {
-            val alreadyInDaily = _dailyGames.value.any { it.gameType == gameType && it.isCompleted }
-            val alreadyInHistory = _scoreHistory.value.any { it.gameType == gameType && it.dateKey == todayStr }
-            !alreadyInDaily && !alreadyInHistory
-        }
-    }
-
-    /**
-     * Verifies if a nickname is unique (not used by any other player).
-     */
-    fun isNicknameAvailable(nickname: String, currentUserId: String? = null): Boolean {
-        val clean = nickname.trim()
-        if (clean.isBlank()) return false
-        val myUid = currentUserId ?: _currentUser.value.id
-        return _players.value.none { player ->
-            player.id != myUid && !player.isCurrentUser && player.name.trim().equals(clean, ignoreCase = true)
-        }
-    }
-
-    fun reactToActivity(activityId: String, emoji: String) {
-        _activities.update { list ->
-            list.map { item ->
-                if (item.id == activityId) {
-                    val isAlreadyReacted = item.userReactions.contains(emoji)
-                    val newReactions = if (isAlreadyReacted) item.userReactions - emoji else item.userReactions + emoji
-                    val delta = if (isAlreadyReacted) -1 else 1
-                    val updated = when (emoji) {
-                        "🔥" -> item.copy(fireReactions = (item.fireReactions + delta).coerceAtLeast(0), userReactions = newReactions)
-                        "👏" -> item.copy(applauseReactions = (item.applauseReactions + delta).coerceAtLeast(0), userReactions = newReactions)
-                        "🎯" -> item.copy(targetReactions = (item.targetReactions + delta).coerceAtLeast(0), userReactions = newReactions)
-                        else -> item
-                    }
-                    db?.collection("activities")?.document(activityId)?.update(
-                        when (emoji) {
-                            "🔥" -> "fireReactions" to updated.fireReactions.toLong()
-                            "👏" -> "applauseReactions" to updated.applauseReactions.toLong()
-                            "🎯" -> "targetReactions" to updated.targetReactions.toLong()
-                            else -> "fireReactions" to updated.fireReactions.toLong()
-                        }.let { mapOf(it.first to it.second) }
-                    )
-                    updated
-                } else item
-            }
-        }
-    }
-
-    /**
-     * Submits a game result with strict rules:
-     * - Termo: 1 submission per variant (Clássico, Dueto, Quarteto) per day.
-     *   Only Quarteto awards points in Season 2026!
-     * - Globle & SizeItUp: 1 record per game per day.
-     * - Capped at 100 points per game, daily cap at 300 points.
-     */
-    fun submitScore(result: ParsedScoreResult): Boolean {
-        // Enforce 1 record per game & variant per day
-        if (!canSubmitGameToday(result.gameType, result.variant)) {
-            return false
-        }
-
-        // Rule: Termo Clássico and Dueto don't award points in Season 2026
-        val isScoringTermo = result.gameType == GameType.TERMO && (result.variant ?: TermoVariant.QUARTETO) == TermoVariant.QUARTETO
-        val effectivePoints = if (result.gameType == GameType.TERMO && !isScoringTermo) {
-            0
-        } else {
-            result.score.coerceIn(0, 100)
-        }
-
-        val uid = Firebase.auth.currentUser?.uid ?: _currentUser.value.id
-        val todayStr = LocalDate.now().toString()
-        val effectiveVariant = if (result.gameType == GameType.TERMO) (result.variant ?: TermoVariant.QUARTETO) else null
-        val variantSuffix = if (effectiveVariant != null) "_${effectiveVariant.id}" else ""
-        val scoreId = "${uid}_${result.gameType.title.lowercase()}${variantSuffix}_$todayStr"
-
-        val historyItem = ScoreHistoryItem(
-            id = scoreId,
-            userId = uid,
-            gameType = result.gameType,
-            variant = effectiveVariant,
-            dateKey = todayStr,
-            score = effectivePoints,
-            details = result.details,
-            rawGrid = result.rawGrid,
-            streak = result.streak
-        )
-
-        // Prepend to history
-        _scoreHistory.update { listOf(historyItem) + it }
-
-        // Write to Firestore if connected
-        db?.let { firestore ->
-            val firestoreScore = FirestoreScore(
-                userId = uid,
-                nickname = _currentUser.value.name,
-                avatarUrl = _currentUser.value.avatarUrl,
-                gameType = result.gameType.title.lowercase(),
-                dateKey = todayStr,
-                score = effectivePoints.toLong(),
-                rawText = result.rawGrid.joinToString("\n"),
-                details = result.details
-            )
-            firestore.collection("scores").document(scoreId).set(firestoreScore.toMap())
-                .addOnFailureListener { e ->
-                    handleFirestoreError(e, OperationType.CREATE, "scores/$scoreId")
-                }
-
-            if (effectivePoints > 0) {
-                val actId = "act_${System.currentTimeMillis()}"
-                val firestoreAct = FirestoreActivity(
-                    userId = uid,
-                    playerName = _currentUser.value.name,
-                    avatarUrl = _currentUser.value.avatarUrl,
-                    gameName = if (effectiveVariant != null) "${result.gameType.title} (${effectiveVariant.label})" else result.gameType.title,
-                    gameLetter = result.gameType.title.first().toString(),
-                    pointsEarned = effectivePoints.toLong()
-                )
-                firestore.collection("activities").document(actId).set(firestoreAct.toMap())
-                    .addOnFailureListener { e ->
-                        handleFirestoreError(e, OperationType.CREATE, "activities/$actId")
-                    }
-            }
-        }
-
-        // Update daily games status (For Termo, only mark completed if Quarteto)
-        _dailyGames.update { games ->
-            games.map { g ->
-                if (g.gameType == result.gameType) {
-                    if (result.gameType == GameType.TERMO) {
-                        if (effectiveVariant == TermoVariant.QUARTETO) {
-                            g.copy(isCompleted = true, points = effectivePoints)
-                        } else g
-                    } else {
-                        g.copy(isCompleted = true, points = effectivePoints)
-                    }
-                } else g
-            }
-        }
-
-        // Update current user points
-        if (effectivePoints > 0) {
-            _currentUser.update { user ->
-                val newToday = (user.todayScore + effectivePoints).coerceAtMost(300)
-                val newTotal = user.totalScore + effectivePoints
-                user.copy(
-                    todayScore = newToday,
-                    totalScore = newTotal,
-                    matchesPlayed = user.matchesPlayed + 1,
-                    streakDays = if (user.streakDays == 0) 1 else user.streakDays
-                )
-            }
-        } else {
-            _currentUser.update { user ->
-                user.copy(matchesPlayed = user.matchesPlayed + 1)
-            }
-        }
-
-        // Update in players list
-        _players.update { list ->
-            val existing = list.find { it.isCurrentUser || it.id == uid }
-            val updatedList = if (existing != null) {
-                list.map { player ->
-                    if (player.id == existing.id) {
-                        player.copy(
-                            score = player.score + effectivePoints,
-                            gamesCount = player.gamesCount + 1,
-                            streak = if (player.streak == 0) 1 else player.streak
-                        )
-                    } else player
-                }
-            } else {
-                list + Player(
-                    id = uid,
-                    name = "Você (${_currentUser.value.name})",
-                    handle = _currentUser.value.handle,
-                    avatarUrl = _currentUser.value.avatarUrl,
-                    score = _currentUser.value.totalScore,
-                    rank = 1,
-                    streak = 1,
-                    gamesCount = 1,
-                    isCurrentUser = true,
-                    badge = "VOCÊ"
-                )
-            }
-            updatedList.sortedByDescending { it.score }.mapIndexed { idx, p ->
-                p.copy(rank = idx + 1, badge = if (idx == 0) "LÍDER" else if (p.isCurrentUser) "VOCÊ" else null)
-            }
-        }
-
-        // Add to activities feed
-        if (effectivePoints > 0) {
-            val newActivity = ActivityFeedItem(
-                id = "act-new-${System.currentTimeMillis()}",
-                playerName = _currentUser.value.name,
-                avatarUrl = _currentUser.value.avatarUrl,
-                gameName = result.gameType.title,
-                gameLetter = result.gameType.title.first().toString(),
-                timeAgo = "agora",
-                pointsEarned = effectivePoints,
-                fireReactions = 1,
-                applauseReactions = 0,
-                targetReactions = 0
-            )
-            _activities.update { listOf(newActivity) + it }
-        }
-
-        _hasDailyScores.value = true
-        return true
-    }
-
-    /**
-     * Deletes a score record.
-     * If the record is from TODAY, unlocks the game so the user can register again today.
-     * If from a PAST DAY, deducts total points without unlocking today's submission.
-     */
-    fun deleteScore(record: ScoreHistoryItem): Boolean {
-        val uid = Firebase.auth.currentUser?.uid ?: _currentUser.value.id
-        val todayStr = LocalDate.now().toString()
-
-        // 1. Remove from local history
-        _scoreHistory.update { list -> list.filterNot { it.id == record.id } }
-
-        // 2. Delete from Firestore if available
-        db?.collection("scores")?.document(record.id)?.delete()
-            ?.addOnFailureListener { e ->
-                handleFirestoreError(e, OperationType.DELETE, "scores/${record.id}")
-            }
-
-        // 3. If today's record: reset daily game and subtract todayScore
-        if (record.isToday || record.dateKey == todayStr) {
-            _dailyGames.update { list ->
-                list.map { g ->
-                    if (g.gameType == record.gameType) {
-                        g.copy(isCompleted = false, points = 0)
-                    } else g
-                }
-            }
-            _currentUser.update { user ->
-                val newToday = (user.todayScore - record.score).coerceAtLeast(0)
-                val newTotal = (user.totalScore - record.score).coerceAtLeast(0)
-                user.copy(
-                    todayScore = newToday,
-                    totalScore = newTotal,
-                    matchesPlayed = (user.matchesPlayed - 1).coerceAtLeast(0)
-                )
-            }
-            // Check if any game is still completed today
-            val anyCompletedToday = _dailyGames.value.any { it.isCompleted }
-            _hasDailyScores.value = anyCompletedToday
-        } else {
-            // Past day: only deduct from totalScore
-            _currentUser.update { user ->
-                val newTotal = (user.totalScore - record.score).coerceAtLeast(0)
-                user.copy(
-                    totalScore = newTotal,
-                    matchesPlayed = (user.matchesPlayed - 1).coerceAtLeast(0)
-                )
-            }
-        }
-
-        // Update in players list
-        _players.update { list ->
-            list.map { player ->
-                if (player.id == uid || player.isCurrentUser) {
-                    player.copy(
-                        score = (player.score - record.score).coerceAtLeast(0),
-                        gamesCount = (player.gamesCount - 1).coerceAtLeast(0)
-                    )
-                } else player
-            }.sortedByDescending { it.score }.mapIndexed { idx, p ->
-                p.copy(rank = idx + 1)
-            }
-        }
-
-        // Update cloud user profile score
-        db?.collection("users")?.document(uid)?.update(
-            mapOf(
-                "totalScore" to _currentUser.value.totalScore.toLong(),
-                "matchesPlayed" to _currentUser.value.matchesPlayed.toLong()
-            )
-        )
-
-        return true
-    }
-
-    fun getEvolutionData(gameFilter: String, timeFilter: String): List<WeeklyComparisonDay> {
-        val days = when (timeFilter) {
-            "Hoje" -> listOf("08h", "11h", "14h", "17h", "20h", "22h", "Agora")
-            "Mês" -> listOf("Sem 1", "Sem 2", "Sem 3", "Sem 4")
-            "Geral" -> listOf("T. 1", "T. 2", "T. 3", "T. 4", "T. 5", "Atual")
-            else -> listOf("Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Hoje")
-        }
-
-        val multiplier = when (gameFilter) {
-            "Termo" -> 0.35f
-            "Globle" -> 0.32f
-            "SizeItUp" -> 0.33f
-            else -> 1.0f
-        }
-
-        val userTotal = _currentUser.value.totalScore.toFloat().coerceAtLeast(1f)
-
-        return days.mapIndexed { idx, label ->
-            val factor = (idx + 1).toFloat() / days.size.toFloat()
-            val userFraction = if (_currentUser.value.totalScore > 0) {
-                (factor * multiplier).coerceIn(0.1f, 1.0f)
-            } else 0f
-
-            WeeklyComparisonDay(
-                dayLabel = label,
-                lucasScore = 0f,
-                carolScore = 0f,
-                guiScore = 0f,
-                userScore = userFraction,
-                lucasRaw = 0,
-                carolRaw = 0,
-                guiRaw = 0,
-                userRaw = (userFraction * userTotal).toInt()
-            )
-        }
-    }
-
-    fun updateProfile(name: String, bio: String, favGame: GameType, avatarUrl: String? = null): Boolean {
-        val trimmedName = name.trim().ifBlank { _currentUser.value.name }
-        if (!isNicknameAvailable(trimmedName, _currentUser.value.id)) {
-            return false
-        }
-        _currentUser.update {
-            it.copy(
-                name = trimmedName,
-                bio = bio,
-                favoriteGame = favGame,
-                avatarUrl = avatarUrl ?: it.avatarUrl
-            )
-        }
-        _players.update { list ->
-            list.map {
-                if (it.isCurrentUser) {
-                    it.copy(
-                        name = trimmedName,
-                        avatarUrl = avatarUrl ?: it.avatarUrl
-                    )
-                } else it
-            }
-        }
-        val uid = Firebase.auth.currentUser?.uid
-        if (uid != null && db != null) {
-            val updates = mutableMapOf<String, Any>(
-                "nickname" to trimmedName,
-                "bio" to bio,
-                "favoriteGame" to favGame.title
-            )
-            if (avatarUrl != null) {
-                updates["avatarUrl"] = avatarUrl
-            }
-            db.collection("users").document(uid).update(updates)
-                .addOnFailureListener { e ->
-                    handleFirestoreError(e, OperationType.UPDATE, "users/$uid")
-                }
-        }
-        return true
     }
 }

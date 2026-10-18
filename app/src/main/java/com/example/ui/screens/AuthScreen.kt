@@ -100,14 +100,16 @@ import com.example.ui.theme.TrophyGold
 
 @Composable
 fun AuthScreen(
-    onLoginSuccess: (String) -> Unit,
+    onLogin: (String, String) -> Result<Any>,
+    onRegister: (String, String, String) -> Result<Any>,
+    onGoogleSuccess: (String) -> Unit = {},
     onNavigateToRecovery: () -> Unit,
     isNicknameAvailable: (String) -> Boolean = { true },
     modifier: Modifier = Modifier
 ) {
     var selectedTab by remember { mutableStateOf("login") } // "login" or "register"
-    var usernameOrEmail by remember { mutableStateOf("mestre_diario@rankus.gg") }
-    var password by remember { mutableStateOf("••••••••••••") }
+    var usernameOrEmail by remember { mutableStateOf("") }
+    var password by remember { mutableStateOf("") }
     var passwordVisible by remember { mutableStateOf(false) }
     var rememberMe by remember { mutableStateOf(true) }
 
@@ -218,7 +220,7 @@ fun AuthScreen(
         // Google Sign-In Primary Action
         GoogleSignInButton(
             onAuthSuccess = { displayName ->
-                onLoginSuccess(displayName)
+                onGoogleSuccess(displayName)
             },
             onAuthError = { errorMsg ->
                 authErrorMessage = errorMsg
@@ -446,7 +448,13 @@ fun AuthScreen(
 
                 // Primary Enter Button
                 Button(
-                    onClick = { onLoginSuccess(usernameOrEmail) },
+                    onClick = {
+                        authErrorMessage = null
+                        val result = onLogin(usernameOrEmail, password)
+                        result.onFailure { err ->
+                            authErrorMessage = err.message ?: "Falha ao entrar. Verifique os dados."
+                        }
+                    },
                     colors = ButtonDefaults.buttonColors(
                         containerColor = NeonGreenContainer,
                         contentColor = NeonGreenDark
@@ -598,11 +606,21 @@ fun AuthScreen(
 
                 Spacer(modifier = Modifier.height(16.dp))
 
-                val canRegister = regName.isNotBlank() && !isRegNameTaken
+                val canRegister = regName.isNotBlank() && !isRegNameTaken && regEmail.isNotBlank() && regPassword.isNotBlank()
                 Button(
                     onClick = {
-                        if (canRegister) {
-                            onLoginSuccess(regName.trim())
+                        authErrorMessage = null
+                        if (regPassword != regConfirmPassword) {
+                            authErrorMessage = "As senhas não coincidem. Digite novamente."
+                            return@Button
+                        }
+                        if (regPassword.length < 6) {
+                            authErrorMessage = "A senha deve ter pelo menos 6 caracteres."
+                            return@Button
+                        }
+                        val result = onRegister(regName.trim(), regEmail.trim(), regPassword)
+                        result.onFailure { err ->
+                            authErrorMessage = err.message ?: "Falha ao registrar conta."
                         }
                     },
                     enabled = canRegister,

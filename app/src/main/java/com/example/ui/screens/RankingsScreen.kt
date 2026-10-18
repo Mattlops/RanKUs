@@ -92,6 +92,7 @@ import com.example.ui.theme.TrophyGold
 @Composable
 fun RankingsScreen(
     players: List<Player>,
+    getRankingPlayers: ((gameFilter: String, timeFilter: String) -> List<Player>)? = null,
     getEvolutionData: (gameFilter: String, timeFilter: String) -> List<WeeklyComparisonDay>,
     onPlayClick: () -> Unit,
     onCadastrarClick: () -> Unit = {},
@@ -107,14 +108,13 @@ fun RankingsScreen(
         getEvolutionData(selectedGamePill, selectedTimeRange)
     }
 
-    // Filter players based on game pill
-    val filteredPlayers = remember(players, selectedGamePill) {
-        when (selectedGamePill) {
-            "Termo" -> players.sortedByDescending { it.winRate * 25 }
-            "Globle" -> players.sortedByDescending { it.globleAvg }
-            "SizeItUp" -> players.sortedByDescending { it.sizeItUpScore }
-            else -> players.sortedByDescending { it.score }
-        }.mapIndexed { index, p -> p.copy(rank = index + 1) }
+    // Dynamic filtered players based on both Game and Time filter
+    val filteredPlayers = remember(players, selectedGamePill, selectedTimeRange) {
+        if (getRankingPlayers != null) {
+            getRankingPlayers(selectedGamePill, selectedTimeRange)
+        } else {
+            players.sortedByDescending { it.score }.mapIndexed { index, p -> p.copy(rank = index + 1) }
+        }
     }
 
     LazyColumn(

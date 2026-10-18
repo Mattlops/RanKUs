@@ -1,72 +1,80 @@
-# Plano de Implementação: RanKUs - Ajustes de Ranking, Temporada, Modos do Termo e Nickname Único
+# Plano de Implementação: Correções Críticas de Segurança, Autenticação, Rankings e Recuperação
 
 ## 1. Visão Geral e Objetivos
-Ajustar o **RanKUs** para eliminar completamente quaisquer dados e nomes fictícios residuais (no Pódio, Gráficos do Ranking e na seção "Destaques" da Home), implementar contagem regressiva de dias até 31 de dezembro, permitir 1 registro por dia para cada modo do Termo (Clássico, Dueto e Quarteto com pontuação apenas no Quarteto), garantir que nicknames sejam estritamente únicos entre jogadores, e esclarecer o status da conexão da base Firebase para a geração do APK.
+Este plano tem como objetivo sanar todos os problemas críticos de autenticação, segurança, persistência e governança identificados no **RanKUs**:
+1. **Persistência de Avatares**: Evitar que as fotos de perfil desapareçam ao reiniciar o app, gravando-as no armazenamento privado interno do aplicativo (`filesDir/avatars`) e sincronizando o caminho no Firestore e SharedPreferences.
+2. **Cálculo Real da Sequência de Dias (Streak)**: Rastrear os dias consecutivos reais em que o usuário registrou jogos, mantendo a sequência ativa e resetando para zero caso deixe de registrar.
+3. **Autenticação Real com Firebase Auth (Segurança Crítica)**: Eliminar qualquer bypass de login fictício. Exigir credenciais válidas com `signInWithEmailAndPassword` e `createUserWithEmailAndPassword`, exibindo mensagens claras de erro.
+4. **Isolamento Estrito do Histórico**: Restringir a visualização e exclusão de partidas na tela de Histórico estritamente aos registros do próprio usuário logado.
+5. **Cálculo Preciso da Pontuação e Presença no Ranking**: Garantir que o ranking reflita a soma exata dos registros válidos de cada usuário, e que o próprio usuário sempre apareça na classificação.
+6. **Filtros Funcionais no Ranking (Jogo e Período)**: Implementar filtragem real tanto por jogo (Todos, Termo, Globle, SizeItUp) quanto por intervalo de datas (Hoje, Semana, Mês, Geral), refletindo tanto na tabela quanto no gráfico de evolução.
+7. **Fluxo Completo de Esqueci Minha Senha**: Reestruturar a tela de recuperação em 4 etapas funcionais: solicitação do e-mail, geração/envio do código de 6 dígitos, validação do código no app e cadastro da nova senha.
 
 ---
 
-## 2. Mudanças Detalhadas
+## 2. Diagnóstico Técnico & Arquitetura
 
-### A. Eliminação de Nomes e Pontos Falsos no Ranking e Pódio
-- **Problema:** Em `RankingsScreen.kt`, o pódio possuía valores de fallback estáticos (`LucasTermo`, `Carol_G`, `Gui_Voxel`), e o gráfico semanal continha linhas fixas com os nomes `Lucas` e `Carol`.
-- **Solução:**
-  - Se a base não possuir jogadores suficientes para o Top 3 (1º, 2º e 3º), os campos do pódio não exibirão nomes falsos: exibirão traços (`"—"`) ou indicação de vaga aberta no pódio (`"Disponível"` / `"Sem competidor"`).
-  - Caso não haja pontuações registradas na base, a tela exibirá o estado de pódio vazio (`EmptyPodiumCard`) convidando para pontuar.
-  - O gráfico de evolução mostrará apenas os dados reais do jogador atual e de competidores reais existentes na base.
+### A. Persistência de Avatares
+- **Causa raiz**: O `ActivityResultContracts.PickVisualMedia` retorna uma URI temporária (`content://media/picker/...`) cujas permissões de leitura expiram assim que o processo do app é encerrado.
+- **Solução**:
+  - Ao receber a URI da galeria, ler os bytes da imagem via `contentResolver.openInputStream(uri)` e salvar em um arquivo permanente: `File(context.filesDir, "avatar_${userId}.jpg")`.
+  - Salvar o caminho `file://${file.absolutePath}` no documento do usuário no Firestore (`users/{uid}.avatarUrl`) e no cache local (SharedPreferences).
+  - Ao abrir o app, carregar imediatamente o avatar local salvo.
 
-### B. Card de Encerramento da Temporada (Contagem até 31 de Dezembro)
-- **Problema:** O card exibia o texto fixo `"Faltam 235 pts para o Pódio! Conclua o Termo Quarteto de hoje para ultrapassar Gui_Voxel."`.
-- **Solução:**
-  - Substituir o card por uma contagem regressiva oficial até o final da temporada anual:
-    - Cálculo dinâmico: `val daysUntilEndOfYear = ChronoUnit.DAYS.between(LocalDate.now(), LocalDate.of(now.year, 12, 31))`.
-    - Título: `"Encerramento da Temporada ${today.year} ⏳"`.
-    - Destaque: `"Faltam $daysUntilEndOfYear dias para 31 de dezembro!"`.
-    - Descrição: `"Acumule seus pontos diários no Termo, Globle e SizeItUp antes do fechamento do ciclo anual."`.
+### B. Autenticação e Segurança (Firebase Auth)
+- **Causa raiz**: O método `login` em `RankusRepository` aceitava qualquer string sem checar senha no Firebase Auth.
+- **Solução**:
+  - `loginWithEmailAndPassword(email, password, onResult)`: executa `Firebase.auth.signInWithEmailAndPassword`, tratando erros (`FirebaseAuthInvalidUserException`, `FirebaseAuthInvalidCredentialsException`).
+  - `registerWithEmailAndPassword(email, password, nickname, onResult)`: executa `Firebase.auth.createUserWithEmailAndPassword`, cria o perfil no Firestore `users/{uid}` com nickname exclusivo.
+  - Manter sessão ativa automaticamente checando `Firebase.auth.currentUser` na inicialização do repositório.
 
-### C. Registro Independente para Cada Modo do Termo (Clássico, Dueto e Quarteto)
-- **Regra:** O jogador agora poderá registrar 1 resultado por dia para **cada modalidade** do Termo:
-  - 1 registro para o **Termo Clássico** (0 pontos na temporada).
-  - 1 registro para o **Termo Dueto** (0 pontos na temporada).
-  - 1 registro para o **Termo Quarteto** (gera até 100 pontos oficiais).
-- **Implementação:**
-  - Atualizar `canSubmitGameToday(gameType: GameType, variant: TermoVariant?)` no repositório para diferenciar por variante quando o jogo for Termo.
-  - A chave única de pontuação diária para o Termo passa a ser `${uid}_termo_${variant.id}_${todayStr}`.
-  - No menu de cadastro, a verificação de duplicidade avalia o modo selecionado/detectado, liberando o envio se o jogador ainda não enviou aquela modalidade específica no dia.
+### C. Cálculo da Sequência Diária (Streak)
+- **Regra**:
+  - Buscar as datas distintas de submissão do usuário (`dateKey` formatado em YYYY-MM-DD).
+  - Iniciar contagem a partir de Hoje (se jogou) ou de Ontem (se ainda não jogou hoje, mas jogou ontem para não perder a sequência antecipadamente).
+  - Contar quantos dias consecutivos ininterruptos existem para trás.
+  - Se não houver registro nem hoje nem ontem, `streak = 0`.
 
-### D. Validação de Nickname Único
-- **Regra:** Não permitir que dois usuários utilizem o mesmo Nickname (case-insensitive).
-- **Implementação:**
-  - No `RankusRepository`, criar a função de checagem `isNicknameAvailable(nickname: String, currentUserId: String): Boolean`.
-  - Verifica no Firestore (`users` collection) e na lista de usuários em memória se já existe alguém cadastrado com o mesmo nome (ignorando maiúsculas/minúsculas).
-  - No modal de edição de perfil (`EditProfileDialog`), caso o nickname inserido já pertença a outro jogador, exibir mensagem de erro em vermelho: `"Este nickname já está em uso por outro jogador. Escolha um nome exclusivo!"` e bloquear a confirmação do salvamento.
+### D. Isolamento do Histórico
+- A lista exposta para `HistoricoScreen` deve aplicar o filtro: `scoreHistory.filter { it.userId == currentUserId }`.
+- A remoção de scores no Firestore só é permitida para `request.auth.uid == resource.data.userId` (já garantido nas security rules).
 
-### E. Seção "Destaques" da Tela Inicial
-- **Problema:** A seção `DestaquesSection` em `HomeScreen.kt` exibia um card fixo com o jogador fictício `"Gabriel 'Apex' Souza"`, avatar estático e pontos não reais.
-- **Solução:**
-  - Conectar a seção de destaques aos dados reais:
-    - Se houver jogadores com pontuação registrada, exibir o **líder real** atual (Top 1) da base com seu nome, avatar, pontuação e streak autênticos.
-    - Se apenas o jogador atual estiver registrado, destacar seu próprio perfil e desempenho de hoje/total.
-    - Se ninguém pontuou ainda, exibir estado esportivo convidando o jogador a ser o primeiro destaque do dia ("O topo do pódio está aberto hoje!").
+### E. Pontuação Total & Filtros do Ranking
+- O `totalScore` no documento do usuário em `users/{uid}` e na memória deve ser a soma de todos os registros de pontuação válidos do usuário.
+- Para a tela de Rankings, a listagem de competidores deve filtrar dinamicamente com base em `selectedGamePill` e `selectedTimeRange`:
+  - **Jogo**: Se "Termo", soma apenas scores com `gameType == "termo"`; se "Globle", apenas "globle"; se "SizeItUp", apenas "sizeitup"; se "Todos os Jogos", soma todos.
+  - **Período**:
+    - "Hoje": registros onde `dateKey == LocalDate.now().toString()`.
+    - "Semana": registros onde `dateKey >= LocalDate.now().minusDays(7).toString()`.
+    - "Mês": registros onde `dateKey >= LocalDate.now().withDayOfMonth(1).toString()`.
+    - "Geral": todos os registros.
 
-### F. Resposta e Garantia de Conexão Firebase / APK
-- Fornecer na resposta final a explicação detalhada de que o aplicativo já está provisionado com `google-services.json`, `firebase_applet_config.xml`, regras de segurança implantadas no Firestore (`firestore.rules`), e que ao instalar o APK a conexão funciona diretamente pela internet com o banco na nuvem.
+### F. Recuperação de Senha (Fluxo 4 Passos)
+1. **Passo 1 (E-mail)**: Usuário digita seu e-mail cadastrado. O app valida se o e-mail existe no banco.
+2. **Passo 2 (Código)**: Um token de 6 dígitos aleatório é gerado (armazenado em documento temporário de recuperação ou estado seguro com validade de 15 minutos). O app dispara o e-mail de recuperação do Firebase (`sendPasswordResetEmail`) e disponibiliza o código para validação.
+3. **Passo 3 (Verificação)**: Usuário digita os 6 dígitos nos inputs. O app valida se o token confere e não expirou.
+4. **Passo 4 (Nova Senha)**: Usuário digita e confirma sua nova senha. O app atualiza a credencial no Firebase Auth e redireciona para o login com mensagem de sucesso.
 
 ---
 
-## 3. Arquivos a Serem Modificados
+## 3. Plano de Arquivos e Modificações
 
-| Arquivo | Ação | Modificações |
-|---|---|---|
-| `app/src/main/java/com/example/ui/screens/RankingsScreen.kt` | Modificar | Remover fallbacks de nomes fictícios no Pódio/Gráfico; substituir card do pódio pela contagem de dias até 31 de dezembro |
-| `app/src/main/java/com/example/ui/screens/HomeScreen.kt` | Modificar | Substituir jogador fake na seção Destaques pelo líder/jogador real da base |
-| `app/src/main/java/com/example/data/RankusRepository.kt` | Modificar | Permitir 1 registro por dia para cada modo do Termo; adicionar verificação de unicidade de Nickname |
-| `app/src/main/java/com/example/ui/screens/CadastrarScreen.kt` | Modificar | Ajustar trava de duplicidade para avaliar a modalidade específica do Termo |
-| `app/src/main/java/com/example/ui/components/ProfileModals.kt` | Modificar | Adicionar validação e alerta visual de Nickname já em uso |
-| `app/src/main/java/com/example/ui/navigation/RankusApp.kt` | Modificar | Passar a lista de jogadores e validação de nickname para a Home e Diálogo de Perfil |
+| Arquivo | Responsabilidade |
+| :--- | :--- |
+| `data/RankusRepository.kt` | Métodos reais de autenticação Firebase (`signIn`, `signUp`, `resetPassword`), cálculo de streak diário consecutivo, salvamento do avatar em arquivo local, atualização de `totalScore` no Firestore, e função de agregação de scores filtrada por jogo e período. |
+| `ui/screens/AuthScreen.kt` | Integração dos campos de e-mail e senha com validação real do Firebase Auth, exibição de mensagens de erro específicas (senha incorreta, e-mail não encontrado, etc.) e bloqueio de credenciais inválidas. |
+| `ui/screens/RecoveryScreen.kt` | Fluxo completo de 4 etapas (E-mail -> Código 6 dígitos -> Validação -> Nova Senha vinculada) com visual gamer moderno. |
+| `ui/screens/RankingsScreen.kt` | Aplicação dos filtros dinâmicos de jogo e período na lista de competidores e no gráfico, exibindo sempre o usuário logado com seus pontos exatos. |
+| `ui/screens/HistoricoScreen.kt` | Garantia de isolamento por `userId` para que nenhum jogador veja registros alheios. |
+| `ui/components/ProfileModals.kt` | Persistência física do arquivo do avatar no `filesDir` e envio ao repositório para gravação definitiva. |
 
 ---
 
-## 4. Verificação
-- Executar `compile_applet` para assegurar build limpo.
-- Executar a suíte de testes unitários (`gradle :app:testDebugUnitTest`).
-- Validar visualmente e logicamente os 3 registros do Termo, a contagem de dias até 31/12, a ausência de dados fictícios e a rejeição de nicknames repetidos.
+## 4. Verificação e Critérios de Aceite
+1. **Teste de Login Inválido**: Tentar logar com credenciais falsas deve falhar com aviso claro em vermelho.
+2. **Teste de Cadastro e Persistência de Sessão**: Criar conta, fechar o app e reabrir — a sessão e o avatar salvo devem permanecer intactos.
+3. **Teste de Streak**: Registrar hoje -> sequência 1; registrar amanhã -> sequência 2; simular dia sem registro -> sequência reinicia em zero.
+4. **Teste de Histórico Pessoal**: Usuário A só vê as partidas do Usuário A.
+5. **Teste de Pontuação e Filtros de Ranking**: Submeter 180 pts no dia 1 e 199 pts no dia 2 -> o ranking geral deve exibir exatamente 379 pts para o usuário, e alternar para "Hoje" deve exibir apenas a pontuação do dia.
+6. **Teste de Recuperação de Senha**: Completar as 4 etapas de recuperação e conseguir logar com a nova senha.
+7. **Compilação**: Executar `compile_applet` e garantir status de sucesso sem avisos impeditivos.

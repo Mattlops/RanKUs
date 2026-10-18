@@ -339,11 +339,23 @@ fun EditProfileDialog(
     val isNameDifferent = displayName.trim().lowercase() != userProfile.name.lowercase()
     val isNameTaken = isNameDifferent && !isNicknameAvailable(displayName.trim())
 
+    val context = LocalContext.current
     val photoPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickVisualMedia()
     ) { uri: Uri? ->
         if (uri != null) {
-            selectedAvatarUri = uri.toString()
+            try {
+                val avatarsDir = java.io.File(context.filesDir, "avatars").apply { mkdirs() }
+                val destFile = java.io.File(avatarsDir, "avatar_${userProfile.id}.jpg")
+                context.contentResolver.openInputStream(uri)?.use { input ->
+                    destFile.outputStream().use { output ->
+                        input.copyTo(output)
+                    }
+                }
+                selectedAvatarUri = Uri.fromFile(destFile).toString()
+            } catch (_: Exception) {
+                selectedAvatarUri = uri.toString()
+            }
         }
     }
 

@@ -70,6 +70,7 @@ import com.example.ui.theme.TrophyGold
 @Composable
 fun HistoricoScreen(
     scoreHistory: List<ScoreHistoryItem>,
+    currentUserId: String = "",
     onDeleteRecord: (ScoreHistoryItem) -> Unit,
     onNavigateToJogos: () -> Unit,
     modifier: Modifier = Modifier
@@ -77,12 +78,18 @@ fun HistoricoScreen(
     var selectedFilter by remember { mutableStateOf<GameType?>(null) }
     var itemToDelete by remember { mutableStateOf<ScoreHistoryItem?>(null) }
 
-    val filteredList = remember(scoreHistory, selectedFilter) {
-        if (selectedFilter == null) scoreHistory
-        else scoreHistory.filter { it.gameType == selectedFilter }
+    // Strictly show ONLY records belonging to current logged-in user
+    val userRecords = remember(scoreHistory, currentUserId) {
+        if (currentUserId.isBlank()) scoreHistory
+        else scoreHistory.filter { it.userId == currentUserId }
     }
 
-    val totalPoints = remember(scoreHistory) { scoreHistory.sumOf { it.score } }
+    val filteredList = remember(userRecords, selectedFilter) {
+        if (selectedFilter == null) userRecords
+        else userRecords.filter { it.gameType == selectedFilter }
+    }
+
+    val totalPoints = remember(userRecords) { userRecords.sumOf { it.score } }
 
     Column(
         modifier = modifier

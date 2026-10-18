@@ -105,8 +105,24 @@ fun RankusApp(
                 // Keep on Auth screen
             }
             AuthScreen(
-                onLoginSuccess = { emailOrUser ->
-                    repository.login(emailOrUser)
+                onLogin = { emailOrUser, password ->
+                    val result = repository.login(emailOrUser, password)
+                    result.onSuccess {
+                        appDestination = AppDestination.MAIN
+                        currentTab = MainTab.INICIO
+                    }
+                    result
+                },
+                onRegister = { name, email, password ->
+                    val result = repository.register(name, email, password)
+                    result.onSuccess {
+                        appDestination = AppDestination.MAIN
+                        currentTab = MainTab.INICIO
+                    }
+                    result
+                },
+                onGoogleSuccess = { displayName ->
+                    repository.onGoogleSignInSuccess(displayName)
                     appDestination = AppDestination.MAIN
                     currentTab = MainTab.INICIO
                 },
@@ -124,6 +140,15 @@ fun RankusApp(
                 appDestination = AppDestination.AUTH
             }
             RecoveryScreen(
+                onSendRecoveryCode = { email ->
+                    repository.sendRecoveryCode(email)
+                },
+                onVerifyRecoveryCode = { email, code ->
+                    repository.verifyRecoveryCode(email, code)
+                },
+                onResetPassword = { email, newPassword ->
+                    repository.resetPassword(email, newPassword)
+                },
                 onBackToLogin = {
                     appDestination = AppDestination.AUTH
                 }
@@ -194,6 +219,7 @@ fun RankusApp(
                                 MainTab.RANKINGS -> {
                                     RankingsScreen(
                                         players = players,
+                                        getRankingPlayers = { g, t -> repository.getRankingPlayers(g, t) },
                                         getEvolutionData = { g, t -> repository.getEvolutionData(g, t) },
                                         onPlayClick = { currentTab = MainTab.JOGOS },
                                         onCadastrarClick = {
@@ -206,6 +232,7 @@ fun RankusApp(
                                 MainTab.HISTORICO -> {
                                     HistoricoScreen(
                                         scoreHistory = scoreHistory,
+                                        currentUserId = currentUser.id,
                                         onDeleteRecord = { record ->
                                             repository.deleteScore(record)
                                         },
